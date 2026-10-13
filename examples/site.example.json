@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "siteId": "example-site",
+  "workingDir": "/srv/example-site/source",
+  "stateDir": "/srv/example-site/worker-state",
+  "candidateRoot": "/srv/example-site/candidates",
+  "source": {
+    "type": "wordpress-rest",
+    "baseUrl": "https://wordpress.example.org",
+    "resources": ["posts", "pages"]
+  },
+  "commands": {
+    "build": ["node", "scripts/content-build.mjs"],
+    "verify": ["node", "scripts/verify-candidate.mjs"],
+    "publish": ["node", "scripts/publish-atomically.mjs"],
+    "verifyPublished": ["node", "scripts/verify-published.mjs"],
+    "rollback": ["node", "scripts/restore-previous-release.mjs"]
+  },
+  "limits": {
+    "maxPages": 100,
+    "maxRecords": 10000,
+    "pageSize": 100,
+    "requestTimeoutMs": 30000,
+    "maxResponseBytes": 10000000,
+    "commandTimeoutMs": 300000,
+    "maxCommandOutputBytes": 50000000
+  }
+}

@@ -1,0 +1,5 @@
+# Operator example only; this repository never installs a scheduled job.
+# Daily at 03:17 in the host's configured timezone. Use real absolute paths.
+# PATH must allow any executables used by the site's argv commands.
+PATH=/usr/local/bin:/usr/bin:/bin
+17 3 * * * /usr/local/bin/node /opt/static-content-worker/bin/static-content-worker.mjs run --config /etc/static-content-worker/example-site.json >> /var/log/example-site-content.log 2>&1

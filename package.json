@@ -1,0 +1,11 @@
+{
+  "name": "static-content-worker",
+  "version": "0.1.0",
+  "description": "Portable WordPress content snapshots and verified static-site publication",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "bin": { "static-content-worker": "bin/static-content-worker.mjs" },
+  "scripts": { "test": "node --test", "check": "node --check bin/static-content-worker.mjs && node --check src/worker.mjs" },
+  "files": ["bin", "src", "examples", "README.md", "LICENSE"]
+}

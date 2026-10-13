@@ -1,0 +1,5 @@
+node_modules/
+.state/
+.candidates/
+*.local.json
+coverage/
