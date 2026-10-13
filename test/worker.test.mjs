@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, mkdir, rm, readdir, realpath } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir, rm, readdir, realpath, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
@@ -32,7 +32,7 @@ async function fixture(t, sourceContent = { posts: [publicPost(1)], pages: [] })
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(root, { recursive: true, force: true }); });
   const script = path.join(root, 'adapter.mjs');
   await writeFile(script, `
-    import { appendFile, readFile, writeFile } from 'node:fs/promises';
+    import { appendFile, readFile, writeFile, rm } from 'node:fs/promises';
     import path from 'node:path';
     const stage = process.argv[2];
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('CONTENT_')));
@@ -40,11 +40,21 @@ async function fixture(t, sourceContent = { posts: [publicPost(1)], pages: [] })
     const snapshot = await readFile(env.CONTENT_SNAPSHOT, 'utf8');
     if (stage === 'build') await writeFile(path.join(env.CONTENT_CANDIDATE_DIR, 'output.txt'), snapshot);
     if (stage === 'publish') await writeFile(path.join(process.cwd(), 'published.txt'), snapshot);
-    if (stage === 'verifyPublished' && await readFile(path.join(process.cwd(), 'published.txt'),'utf8') !== snapshot) process.exit(3);
-    if (stage === 'rollback' && env.CONTENT_PREVIOUS_SNAPSHOT) await writeFile(path.join(process.cwd(),'published.txt'), await readFile(env.CONTENT_PREVIOUS_SNAPSHOT));
+    if (stage === 'verifyPublished') {
+      if (await readFile(path.join(process.cwd(), 'published.txt'),'utf8') !== snapshot) process.exit(3);
+      await writeFile(env.CONTENT_PUBLICATION_RECEIPT, JSON.stringify({schemaVersion:1,siteId:env.CONTENT_SITE_ID,contentHash:env.CONTENT_HASH,status:'verified',releaseId:'release-'+env.CONTENT_HASH.slice(0,12),sourceRevision:'test-revision',verifiedAt:new Date().toISOString()}));
+    }
+    if (stage === 'rollback') {
+      if (env.CONTENT_PREVIOUS_SNAPSHOT) await writeFile(path.join(process.cwd(),'published.txt'), await readFile(env.CONTENT_PREVIOUS_SNAPSHOT));
+      else await rm(path.join(process.cwd(),'published.txt'), {force:true});
+    }
+    if (stage === 'verifyRollback') {
+      if (env.CONTENT_PREVIOUS_SNAPSHOT && await readFile(path.join(process.cwd(),'published.txt'),'utf8') !== await readFile(env.CONTENT_PREVIOUS_SNAPSHOT,'utf8')) process.exit(4);
+      if (!env.CONTENT_PREVIOUS_SNAPSHOT) { try { await readFile(path.join(process.cwd(),'published.txt')); process.exit(5); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+    }
   `);
-  const commands = Object.fromEntries(['build', 'verify', 'publish', 'verifyPublished', 'rollback'].map(stage => [stage, [node, script, stage]]));
-  const config = { schemaVersion: 1, siteId: 'test-site', workingDir: root, stateDir: path.join(root, 'state'), candidateRoot: path.join(root, 'candidates'), source: { type: 'wordpress-rest', baseUrl: `http://127.0.0.1:${server.address().port}` }, commands };
+  const commands = Object.fromEntries(['build', 'verify', 'publish', 'verifyPublished', 'rollback', 'verifyRollback'].map(stage => [stage, [node, script, stage]]));
+  const config = { schemaVersion: 1, siteId: 'test-site', workingDir: root, stateDir: path.join(root, 'state'), candidateRoot: path.join(root, 'candidates'), source: { type: 'wordpress-rest', baseUrl: `http://127.0.0.1:${server.address().port}`, allowInsecureHttp: true, allowPrivateAddress: true }, commands };
   const calls = async () => { try { return (await readFile(path.join(root, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse); } catch (error) { if (error.code === 'ENOENT') return []; throw error; } };
   return { root, source, requests, config, calls, server };
 }
@@ -121,7 +131,7 @@ for (const failedStage of ['build', 'verify', 'publish', 'verifyPublished']) {
     const failure = JSON.parse(await readFile(path.join(f.config.candidateRoot, failedDir, 'failure.json'), 'utf8'));
     assert.equal(failure.stage, failedStage);
     const calls = await f.calls();
-    assert.equal(calls.at(-1).stage === 'rollback', ['publish', 'verifyPublished'].includes(failedStage));
+    assert.equal(calls.at(-1).stage === 'verifyRollback', ['publish', 'verifyPublished'].includes(failedStage));
     await assert.rejects(readFile(path.join(f.config.stateDir, 'run.lock', 'owner.json')), { code: 'ENOENT' });
   });
 }
@@ -129,7 +139,7 @@ for (const failedStage of ['build', 'verify', 'publish', 'verifyPublished']) {
 test('state advances only after public verification completes', async t => {
   const f = await fixture(t);
   const gate = path.join(f.root, 'gate');
-  f.config.commands.verifyPublished = [node, '-e', `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(gate)},'entered'); setTimeout(()=>process.exit(0),400)`];
+  f.config.commands.verifyPublished = [node, '-e', `const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(gate)},'entered'); setTimeout(()=>{fs.writeFileSync(process.env.CONTENT_PUBLICATION_RECEIPT,JSON.stringify({schemaVersion:1,siteId:process.env.CONTENT_SITE_ID,contentHash:process.env.CONTENT_HASH,status:'verified',releaseId:'release-'+process.env.CONTENT_HASH.slice(0,12),sourceRevision:'test-revision',verifiedAt:new Date().toISOString()}));process.exit(0)},400)`];
   const running = run(f.config);
   for (let attempt = 0; attempt < 100; attempt++) {
     try { await readFile(gate); break; } catch { await new Promise(resolve => setTimeout(resolve, 10)); }
@@ -229,6 +239,14 @@ test('mutated candidate snapshot fails before publication and corrupt previous s
   assert.equal((await f.calls()).length, 4);
 });
 
+test('corrupt previous publication receipt fails before commands', async t => {
+  const f = await fixture(t);
+  const first = await run(f.config);
+  await writeFile(first.lastSuccessful.publication.receipt, '{}');
+  await assert.rejects(run(f.config), /publication receipt is missing or changed/);
+  assert.equal((await f.calls()).length, 4);
+});
+
 test('rollback failure is reported without state advancement', async t => {
   const f = await fixture(t);
   f.config.commands.publish = [node, '-e', 'process.exit(8)'];
@@ -237,12 +255,34 @@ test('rollback failure is reported without state advancement', async t => {
   assert.equal(await readState(validateConfig(f.config)), null);
 });
 
+test('successful public check must write a matching verified publication receipt', async t => {
+  const f = await fixture(t);
+  f.config.commands.verifyPublished = [node, '-e', 'process.exit(0)'];
+  await assert.rejects(run(f.config), /publication-receipt\.json|Publication receipt/);
+  assert.equal((await f.calls()).at(-1).stage, 'verifyRollback');
+  assert.equal(await readState(validateConfig(f.config)), null);
+
+  f.config.commands.verifyPublished = [node, '-e', `require('node:fs').writeFileSync(process.env.CONTENT_PUBLICATION_RECEIPT,JSON.stringify({schemaVersion:1,siteId:process.env.CONTENT_SITE_ID,contentHash:'wrong',status:'verified',releaseId:'release-wrong',sourceRevision:'test-revision',verifiedAt:new Date().toISOString()}))`];
+  await assert.rejects(run(f.config), /receipt does not match/);
+  assert.equal(await readState(validateConfig(f.config)), null);
+});
+
+test('rollback restoration must pass its independent verification', async t => {
+  const f = await fixture(t);
+  const first = await run(f.config);
+  f.source.posts[0].content.rendered = 'Next';
+  f.config.commands.verifyPublished = [node, '-e', 'process.exit(9)'];
+  f.config.commands.verifyRollback = [node, '-e', 'process.exit(10)'];
+  await assert.rejects(run(f.config), /rollback also failed: verifyRollback failed \(10\)/);
+  assert.equal((await readState(validateConfig(f.config))).lastSuccessful.hash, first.lastSuccessful.hash);
+});
+
 test('failed initial state write invokes rollback after verification and retains recovery evidence', async t => {
   const f = await fixture(t);
   const statePath = path.join(f.config.stateDir, 'state.json');
-  f.config.commands.verifyPublished = [node, '-e', `require('node:fs').mkdirSync(${JSON.stringify(statePath)})`];
-  await assert.rejects(run(f.config), /EISDIR|EPERM|ENOTDIR/);
-  assert.equal((await f.calls()).at(-1).stage, 'rollback');
+  f.config.commands.verifyPublished = [node, '-e', `const fs=require('node:fs'); fs.writeFileSync(process.env.CONTENT_PUBLICATION_RECEIPT,JSON.stringify({schemaVersion:1,siteId:process.env.CONTENT_SITE_ID,contentHash:process.env.CONTENT_HASH,status:'verified',releaseId:'release-'+process.env.CONTENT_HASH.slice(0,12),sourceRevision:'test-revision',verifiedAt:new Date().toISOString()})); fs.mkdirSync(${JSON.stringify(statePath)})`];
+  await assert.rejects(run(f.config), /Refusing to replace non-regular file|EISDIR|EPERM|ENOTDIR/);
+  assert.equal((await f.calls()).at(-1).stage, 'verifyRollback');
   const dirs = await readdir(f.config.candidateRoot);
   const failure = JSON.parse(await readFile(path.join(f.config.candidateRoot, dirs[0], 'failure.json'), 'utf8'));
   assert.equal(failure.stage, 'state');
@@ -258,14 +298,60 @@ test('HTTP errors, malformed JSON and body timeouts retain previous success', as
   f.server.on('request', (req, res) => { res.writeHead(503); res.end('Unavailable'); });
   await assert.rejects(run(f.config), /HTTP 503/);
   f.server.removeAllListeners('request');
-  f.server.on('request', (req, res) => { res.end('{broken'); });
+  f.server.on('request', (req, res) => { res.setHeader('content-type', 'application/json'); res.end('{broken'); });
   await assert.rejects(run(f.config), /JSON|Expected/);
   f.server.removeAllListeners('request');
-  f.server.on('request', (req, res) => { res.writeHead(200); res.write('['); });
+  f.server.on('request', (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.write('['); });
   f.config.limits = { requestTimeoutMs: 50 };
   await assert.rejects(run(f.config), /abort/i);
   assert.equal(await readFile(path.join(f.config.stateDir, 'state.json'), 'utf8'), stateText);
   assert.equal((await readState(validateConfig(f.config))).lastSuccessful.hash, first.lastSuccessful.hash);
+});
+
+test('REST source requires explicit local HTTP/private-address opt-ins and JSON content type', async t => {
+  const f = await fixture(t);
+  const noHttpOptIn = structuredClone(f.config);
+  delete noHttpOptIn.source.allowInsecureHttp;
+  assert.throws(() => validateConfig(noHttpOptIn), /must use HTTPS/);
+
+  const noPrivateOptIn = structuredClone(f.config);
+  delete noPrivateOptIn.source.allowPrivateAddress;
+  await assert.rejects(run(noPrivateOptIn), /non-public address/);
+
+  f.server.removeAllListeners('request');
+  f.server.on('request', (req, res) => { res.setHeader('content-type', 'text/html'); res.end('[]'); });
+  await assert.rejects(run(f.config), /unexpected content type/);
+  assert.deepEqual(await f.calls(), []);
+});
+
+test('runtime paths and state files reject symlinks', async t => {
+  const f = await fixture(t);
+  const linkedWork = path.join(f.root, 'linked-work');
+  await symlink(f.root, linkedWork);
+  const linkedConfig = { ...f.config, workingDir: linkedWork };
+  await assert.rejects(run(linkedConfig), /workingDir must be a real directory/);
+
+  await mkdir(f.config.stateDir, { recursive: true });
+  const outsideState = path.join(f.root, 'outside-state.json');
+  await writeFile(outsideState, '{}');
+  await symlink(outsideState, path.join(f.config.stateDir, 'state.json'));
+  await assert.rejects(run(f.config), /must not be a symlink|ELOOP/);
+  assert.deepEqual(await f.calls(), []);
+});
+
+test('aborting a run terminates its active stage and preserves state', async t => {
+  const f = await fixture(t);
+  f.config.commands.build = [node, '-e', 'setInterval(()=>{},1000)'];
+  const controller = new AbortController();
+  const running = run(f.config, { signal: controller.signal });
+  const owner = path.join(f.config.stateDir, 'run.lock', 'owner.json');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { await readFile(owner); break; } catch { await new Promise(resolve => setTimeout(resolve, 10)); }
+  }
+  controller.abort();
+  await assert.rejects(running, /build aborted/);
+  assert.equal(await readState(validateConfig(f.config)), null);
+  await assert.rejects(readFile(owner), { code: 'ENOENT' });
 });
 
 test('a stale lock requires explicit recovery and a retry succeeds', async t => {
@@ -282,7 +368,14 @@ test('a stale lock requires explicit recovery and a retry succeeds', async t => 
 test('invalid config fails before paths or commands are used', () => {
   assert.throws(() => validateConfig({ schemaVersion: 1, siteId: '../escape' }), /siteId/);
   assert.throws(() => validateConfig({ schemaVersion: 1, siteId: 'test', workingDir: 'relative' }), /workingDir must be absolute/);
+  assert.throws(() => validateConfig({ schemaVersion: 1, extra: true }), /unknown key/);
+  assert.throws(() => validateConfig({ schemaVersion: 1, siteId: 'test', workingDir: '/tmp/work', stateDir: '/tmp/state', candidateRoot: '/tmp/candidates', source: { type: 'command', exportCommand: ['node', 'export.mjs'] }, commands: {} }), /executable must be absolute/);
+  const paired = { schemaVersion: 1, siteId: 'test', workingDir: '/tmp/work', stateDir: '/tmp/state', candidateRoot: '/tmp/candidates', source: { type: 'command', exportCommand: [node, 'export.mjs'] }, commands: Object.fromEntries(stagesForTest().map(stage => [stage, [node, stage]])) };
+  paired.commands.rollback = [node, 'rollback'];
+  assert.throws(() => validateConfig(paired), /configured together/);
 });
+
+function stagesForTest() { return ['build', 'verify', 'publish', 'verifyPublished']; }
 
 test('CLI prints valid JSON status and fails missing configuration', async t => {
   const f = await fixture(t);

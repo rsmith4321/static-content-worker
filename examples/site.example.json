@@ -10,11 +10,12 @@
     "resources": ["posts", "pages"]
   },
   "commands": {
-    "build": ["node", "scripts/content-build.mjs"],
-    "verify": ["node", "scripts/verify-candidate.mjs"],
-    "publish": ["node", "scripts/publish-atomically.mjs"],
-    "verifyPublished": ["node", "scripts/verify-published.mjs"],
-    "rollback": ["node", "scripts/restore-previous-release.mjs"]
+    "build": ["/usr/local/bin/node", "scripts/content-build.mjs"],
+    "verify": ["/usr/local/bin/node", "scripts/verify-candidate.mjs"],
+    "publish": ["/usr/local/bin/node", "scripts/publish-atomically.mjs"],
+    "verifyPublished": ["/usr/local/bin/node", "scripts/verify-published.mjs"],
+    "rollback": ["/usr/local/bin/node", "scripts/restore-previous-release.mjs"],
+    "verifyRollback": ["/usr/local/bin/node", "scripts/verify-rollback.mjs"]
   },
   "limits": {
     "maxPages": 100,
