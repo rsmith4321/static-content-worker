@@ -3,9 +3,12 @@ import { lookup } from 'node:dns/promises';
 import { constants } from 'node:fs';
 import { hostname } from 'node:os';
 import { spawn } from 'node:child_process';
+import { get as httpGet } from 'node:http';
+import { get as httpsGet } from 'node:https';
 import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import path from 'node:path';
+import { isPublicAddress } from './public-address.mjs';
 
 const collections = ['posts', 'pages', 'media', 'categories', 'tags'];
 const stages = ['build', 'verify', 'publish', 'verifyPublished'];
@@ -96,49 +99,47 @@ export function normalizeSnapshot(value, source) {
   return { ...value, schemaVersion: 1, source: { ...value.source, ...source }, collections: normalized };
 }
 
-function privateAddress(address) {
-  if (isIP(address) === 4) {
-    const bytes = address.split('.').map(Number);
-    const [a, b] = bytes;
-    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127)
-      || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && (b === 0 || b === 88 || b === 168)) || (a === 198 && (b === 18 || b === 19 || b === 51))
-      || (a === 203 && b === 0)
-      || a >= 224;
-  }
-  if (isIP(address) === 6) {
-    const value = address.toLowerCase();
-    if (value.startsWith('::ffff:')) return privateAddress(value.slice(7));
-    return value === '::' || value === '::1' || value.startsWith('fc') || value.startsWith('fd')
-      || /^fe[89ab]/.test(value) || value.startsWith('ff') || value.startsWith('2001:db8:');
-  }
-  return true;
+async function resolveSourceAddress(url, config) {
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  const addresses = isIP(host) ? [{ address: host, family: isIP(host) }] : await lookup(host, { all: true, verbatim: true });
+  if (!addresses.length || (!config.source.allowPrivateAddress && !addresses.every(({ address }) => isPublicAddress(address)))) throw new Error(`WordPress source resolves to a non-public address: ${url.hostname}`);
+  return addresses[0];
 }
 
-async function assertSourceAddress(url, config) {
-  if (config.source.allowPrivateAddress) return;
-  const addresses = isIP(url.hostname) ? [{ address: url.hostname }] : await lookup(url.hostname, { all: true, verbatim: true });
-  if (!addresses.length || addresses.some(({ address }) => privateAddress(address))) throw new Error(`WordPress source resolves to a non-public address: ${url.hostname}`);
+async function requestSource(url, config, signal) {
+  const selected = await resolveSourceAddress(url, config);
+  const request = url.protocol === 'https:' ? httpsGet : httpGet;
+  return await new Promise((resolve, reject) => {
+    const outgoing = request(url, {
+      signal,
+      headers: { accept: 'application/json' },
+      lookup: (_hostname, options, callback) => options?.all
+        ? callback(null, [selected])
+        : callback(null, selected.address, selected.family),
+    }, resolve);
+    outgoing.once('error', reject);
+  });
 }
 
 async function fetchJSON(url, config, signal) {
-  await assertSourceAddress(url, config);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.limits.requestTimeoutMs);
   try {
     const requestSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
-    const response = await fetch(url, { signal: requestSignal, headers: { accept: 'application/json' }, redirect: 'error' });
-    if (!response.ok) throw new Error(`WordPress returned HTTP ${response.status} for ${url.pathname}`);
-    const type = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() ?? '';
+    const response = await requestSource(url, config, requestSignal);
+    const status = response.statusCode || 0;
+    if (status < 200 || status >= 300) { response.destroy(); throw new Error(`WordPress returned HTTP ${status} for ${url.pathname}`); }
+    const type = String(response.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
     if (type !== 'application/json' && !/^application\/[a-z0-9.+-]+\+json$/.test(type)) throw new Error(`WordPress returned an unexpected content type for ${url.pathname}`);
     const chunks = [];
     let size = 0;
-    for await (const chunk of response.body) {
+    for await (const chunk of response) {
       size += chunk.length;
-      if (size > config.limits.maxResponseBytes) { controller.abort(); throw new Error('WordPress response exceeds maxResponseBytes'); }
+      if (size > config.limits.maxResponseBytes) { response.destroy(); throw new Error('WordPress response exceeds maxResponseBytes'); }
       chunks.push(chunk);
     }
-    return { data: JSON.parse(Buffer.concat(chunks).toString('utf8')), pages: response.headers.get('x-wp-totalpages') };
+    const pagesHeader = response.headers['x-wp-totalpages'];
+    return { data: JSON.parse(Buffer.concat(chunks).toString('utf8')), pages: Array.isArray(pagesHeader) ? pagesHeader[0] : pagesHeader ?? null };
   } finally { clearTimeout(timer); }
 }
 

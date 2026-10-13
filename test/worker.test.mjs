@@ -7,6 +7,12 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { run, readState, canonical, normalizeSnapshot, validateConfig, unlock } from '../src/worker.mjs';
+import { isPublicAddress } from '../src/public-address.mjs';
+
+test('REST source address policy accepts public IPs and rejects reserved networks', () => {
+  for (const address of ['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111', '2001:4860:4860::8888']) assert.equal(isPublicAddress(address), true, address);
+  for (const address of ['127.0.0.1', '10.0.0.1', '169.254.169.254', '192.168.1.1', '198.51.100.2', '::1', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1', '2001:db8::1', 'not-an-ip']) assert.equal(isPublicAddress(address), false, address);
+});
 
 const node = process.execPath;
 const publicPost = (id, content = 'Original') => ({ id, status: 'publish', title: { rendered: `Post ${id}` }, content: { rendered: content }, featured_media: 0, categories: [], tags: [] });
